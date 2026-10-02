@@ -36,3 +36,4 @@ models/*.pth
 # Temporary files
 *.tmp
 *.temp
+videos/
