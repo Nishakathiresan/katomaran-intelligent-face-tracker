@@ -1,0 +1,11 @@
+{
+  "video_source": "data/sample.mp4",
+  "detection_skip_frames": 3,
+  "detector_weights": "models/yolov8n-face.pt",
+  "det_conf": 0.5,
+  "similarity_threshold": 0.45,
+  "exit_timeout_frames": 30,
+  "min_face_size": 40,
+  "db_path": "data/visitors.db",
+  "log_dir": "logs"
+}
