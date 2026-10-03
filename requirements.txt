@@ -3,3 +3,4 @@ numpy
 ultralytics
 insightface
 onnxruntime
+supervision==0.30.6

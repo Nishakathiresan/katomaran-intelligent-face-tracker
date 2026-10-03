@@ -1,5 +1,5 @@
 {
-  "video_source": "data/sample.mp4",
+  "video_source": "videos/sample1.mp4",
   "detection_skip_frames": 3,
   "detector_weights": "models/yolov8n-face.pt",
   "det_conf": 0.5,

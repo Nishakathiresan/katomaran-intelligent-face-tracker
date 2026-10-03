@@ -1,63 +1,303 @@
-import cv2, json, numpy as np, supervision as sv
-from ultralytics import YOLO
-from insightface.app import FaceAnalysis
+import cv2
+import json
 
-cfg = json.load(open("config.json"))
-yolo = YOLO(cfg["detector_weights"])
-fa = FaceAnalysis(name="buffalo_l", providers=["CUDAExecutionProvider","CPUExecutionProvider"])
-fa.prepare(ctx_id=0, det_size=(160, 160))
-tracker = sv.ByteTrack(lost_track_buffer=cfg["exit_timeout_frames"])
+from src.detector import FaceDetector
+from src.embedder import FaceEmbedder
+from src.tracker import FaceTracker
+from src.database import FaceDatabase
+from src.logger import AppLogger
 
-def embed(frame, box, pad=0.3):
-    x1,y1,x2,y2 = map(int, box); w,h = x2-x1, y2-y1
-    x1,y1 = max(0,int(x1-pad*w)), max(0,int(y1-pad*h))
-    x2,y2 = int(x2+pad*w), int(y2+pad*h)
-    faces = fa.get(frame[y1:y2, x1:x2])          # padded crop so InsightFace can align
-    if not faces: return None
-    f = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
-    return f.normed_embedding                      # 512-d, L2-normalized
 
-def match(emb, gallery):                           # gallery: {face_id: embedding}
-    best_id, best_sim = None, -1
-    for fid, g in gallery.items():
-        s = float(np.dot(emb, g))
-        if s > best_sim: best_id, best_sim = fid, s
-    return best_id if best_sim >= cfg["similarity_threshold"] else None
+class FaceTrackingPipeline:
+    def __init__(self, config_path="config.json"):
+        # Load configuration
+        with open(config_path, "r", encoding="utf-8") as file:
+            self.config = json.load(file)
 
-cap = cv2.VideoCapture(cfg["video_source"])
-track2face, last_seen, last_crop = {}, {}, {}
-idx = 0
-while True:
-    ok, frame = cap.read()
-    if not ok: break
-    idx += 1
-    if idx % cfg["detection_skip_frames"]: continue
+        # Create components
+        self.detector = FaceDetector(
+            self.config["detector_weights"],
+            self.config["det_conf"]
+        )
 
-    dets = sv.Detections.from_ultralytics(yolo(frame, conf=cfg["det_conf"], verbose=False)[0])
-    tracked = tracker.update_with_detections(dets)
+        self.embedder = FaceEmbedder()
 
-    for box, tid in zip(tracked.xyxy, tracked.tracker_id):
-        x1,y1,x2,y2 = map(int, box)
-        if min(x2-x1, y2-y1) < cfg["min_face_size"]: continue
-        crop = frame[max(0,y1):y2, max(0,x1):x2]
-        last_seen[tid], last_crop[tid] = idx, crop
-        if tid not in track2face:
-            emb = embed(frame, box)
-            if emb is None: continue
-            fid = match(emb, gallery)
-            if fid is None:
-                fid = db.register_face(emb); gallery[fid] = emb
-                log.info(f"NEW FACE registered id={fid}")
-            else:
-                log.info(f"Face recognized id={fid}")
-            track2face[tid] = fid
-            events.log_event(fid, "entry", crop)      # saves image + DB row + log line
-        # else: log.debug tracking
+        self.tracker = FaceTracker(
+            self.config["exit_timeout_frames"]
+        )
 
-    # exits
-    for tid in [t for t,l in last_seen.items() if idx-l > cfg["exit_timeout_frames"] and t in track2face]:
-        events.log_event(track2face.pop(tid), "exit", last_crop.pop(tid)); last_seen.pop(tid)
+        self.database = FaceDatabase(
+            self.config["db_path"]
+        )
 
-# flush remaining tracks at end of stream as exits
-for tid, fid in track2face.items():
-    events.log_event(fid, "exit", last_crop[tid])
+        self.logger = AppLogger(
+            self.config["log_dir"]
+        )
+
+        # Load already registered faces
+        self.gallery = self.database.get_faces()
+
+        # Track information
+        self.track_to_face = {}
+        self.last_seen = {}
+        self.last_crop = {}
+
+        # Active recognized faces
+        self.active_faces = {}
+
+    def find_matching_face(self, embedding):
+        best_id = None
+        best_similarity = -1.0
+
+        for face_id, stored_embedding in self.gallery.items():
+            similarity = float(
+                embedding @ stored_embedding
+            )
+
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_id = face_id
+
+        if (
+            best_id is not None
+            and best_similarity >= self.config["similarity_threshold"]
+        ):
+            return best_id
+
+        return None
+
+    def process_video(self):
+        video_path = self.config["video_source"]
+
+        cap = cv2.VideoCapture(video_path)
+
+        if not cap.isOpened():
+            raise RuntimeError(
+                f"Could not open video: {video_path}"
+            )
+
+        frame_number = 0
+
+        self.logger.info(
+            f"Starting video processing: {video_path}"
+        )
+
+        while True:
+            success, frame = cap.read()
+
+            if not success:
+                break
+
+            frame_number += 1
+
+            # Process only selected frames
+            if (
+                frame_number
+                % self.config["detection_skip_frames"]
+                != 0
+            ):
+                continue
+
+            # Face detection
+            result = self.detector.detect(frame)
+
+            detections = self._convert_detections(result)
+
+            # Tracking
+            tracked = self.tracker.update(detections)
+
+            if tracked.tracker_id is None:
+                continue
+
+            for box, track_id in zip(
+                tracked.xyxy,
+                tracked.tracker_id
+            ):
+                track_id = int(track_id)
+
+                x1, y1, x2, y2 = map(
+                    int,
+                    box
+                )
+
+                width = x2 - x1
+                height = y2 - y1
+
+                # Ignore very small faces
+                if (
+                    min(width, height)
+                    < self.config["min_face_size"]
+                ):
+                    continue
+
+                # Keep coordinates inside frame
+                x1 = max(0, x1)
+                y1 = max(0, y1)
+                x2 = min(frame.shape[1], x2)
+                y2 = min(frame.shape[0], y2)
+
+                crop = frame[y1:y2, x1:x2]
+
+                if crop.size == 0:
+                    continue
+
+                self.last_seen[track_id] = frame_number
+                self.last_crop[track_id] = crop
+
+                # New track
+                if track_id not in self.track_to_face:
+
+                    embedding = self.embedder.get_embedding(
+                        frame,
+                        box
+                    )
+
+                    if embedding is None:
+                        continue
+
+                    face_id = self.find_matching_face(
+                        embedding
+                    )
+
+                    # New person
+                    if face_id is None:
+
+                        face_id = self.database.register_face(
+                            embedding
+                        )
+
+                        self.gallery[face_id] = embedding
+
+                        self.logger.info(
+                            f"New face registered: id={face_id}"
+                        )
+
+                    # Existing person
+                    else:
+                        self.logger.info(
+                            f"Face recognized: id={face_id}"
+                        )
+
+                    self.track_to_face[
+                        track_id
+                    ] = face_id
+
+                    # Add this tracking ID to the active face
+                    if face_id not in self.active_faces:
+                        self.active_faces[face_id] = set()
+
+                    self.active_faces[face_id].add(track_id)
+
+                    # Log entry only when this face was not already active
+                    if len(self.active_faces[face_id]) == 1:
+                        self.database.log_event(
+                            face_id,
+                            "entry"
+                        )
+
+            # Check for people who have left
+            self._check_exits(frame_number)
+
+        cap.release()
+
+        # Mark remaining tracked people as exited
+        self._flush_remaining_tracks()
+
+        self.database.close()
+
+        self.logger.info(
+            "Video processing completed."
+        )
+
+    def _convert_detections(self, result):
+        """
+        Convert Ultralytics result to supervision Detections.
+        """
+        import supervision as sv
+
+        return sv.Detections.from_ultralytics(
+            result
+        )
+
+    def _check_exits(self, current_frame):
+        timeout = self.config[
+            "exit_timeout_frames"
+        ]
+
+        expired_tracks = []
+
+        for track_id, last_frame in self.last_seen.items():
+
+            if (
+                current_frame - last_frame
+                > timeout
+            ):
+                expired_tracks.append(track_id)
+
+        for track_id in expired_tracks:
+
+            face_id = self.track_to_face.pop(
+                track_id,
+                None
+            )
+
+            self.last_seen.pop(
+                track_id,
+                None
+            )
+
+            self.last_crop.pop(
+                track_id,
+                None
+            )
+
+            if face_id is not None:
+
+                # Remove this tracking ID from the active face
+                if face_id in self.active_faces:
+                    self.active_faces[face_id].discard(track_id)
+
+                    # Remove face only when no tracking IDs remain
+                    if not self.active_faces[face_id]:
+                        self.active_faces.pop(face_id)
+
+                        self.database.log_event(
+                            face_id,
+                            "exit"
+                        )
+
+                        self.logger.info(
+                            f"Face exited: id={face_id}"
+                        )
+
+    def _flush_remaining_tracks(self):
+        for track_id, face_id in list(
+            self.track_to_face.items()
+        ):
+
+            # Remove this tracking ID from the active face
+            if face_id in self.active_faces:
+                self.active_faces[face_id].discard(track_id)
+
+                # Log only one exit for each active face
+                if not self.active_faces[face_id]:
+                    self.active_faces.pop(face_id)
+
+                    self.database.log_event(
+                        face_id,
+                        "exit"
+                    )
+
+                    self.logger.info(
+                        f"Face exited at end of video: id={face_id}"
+                    )
+
+        self.track_to_face.clear()
+        self.last_seen.clear()
+        self.last_crop.clear()
+        self.active_faces.clear()
+
+
+if __name__ == "__main__":
+    pipeline = FaceTrackingPipeline()
+    pipeline.process_video()
